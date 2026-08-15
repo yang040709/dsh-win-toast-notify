@@ -14,8 +14,11 @@
 ## Features
 
 - 🎯 **Fires exactly once per completed task** — listens to DSH's `agent/status` event and notifies on `idle` (no driver remains scheduled or active).
+- 📊 **Rich completion stats** — every toast carries the session title, turn number, elapsed time, tool-call count, and model name.
+- 🚨 **Immediate error alerts** — a separate toast fires the moment `agent/error` is emitted, with the error message; the completion toast then reports the outcome (`任务结束（有错误）`) and switches to the IM sound.
+- 🖱️ **Click-through** — clicking the toast (or its **打开 DSH** button) opens the DSH web UI in your default browser via protocol activation.
 - 🌳 **Root-agent filter** — subagents and workflow children are filtered out via the `agents` service, so background delegation doesn't spam you.
-- 🔔 **Native Windows toast** — real notification-center entry with default notification sound, not a console popup.
+- 🔔 **Native Windows toast** — real notification-center entry with sound, not a console popup.
 - 🪶 **Zero Windows-side dependencies** — no BurntToast, no SnoreToast, no extra install: `powershell.exe` + WinRT, invoked through WSL interop.
 - 🛡️ **Graceful on non-WSL** — feature-detects `powershell.exe` at startup; outside WSL the plugin simply stays silent.
 - 🧩 **Host-only** — no Client half, no browser approval needed to activate.
@@ -28,10 +31,13 @@
 │  Dynamic Host plugin                 │            │  通知中心 (Action Center)     │
 │                                      │            │                             │
 │  ctx.on('agent/status')              │            │  ┌────────────────────────┐ │
-│    └─ status === 'idle' ?            │            │  │ DeepSeek Harness       │ │
-│       └─ root agent only             │            │  │ 任务已完成 [a1b2c3d4]   │ │
-│            │                         │            │  └────────────────────────┘ │
-│            ▼                         │            │            ▲                │
+│    └─ status === 'idle' ?            │            │  │ <会话标题>              │ │
+│       └─ root agent only             │            │  │ 任务已完成 · 第3轮      │ │
+│       + stats (turn/tools/           │            │  │ · 耗时2分35秒          │ │
+│         duration/model)              │            │  │ · 工具调用12次          │ │
+│            │                         │            │  │ [打开 DSH] ──click─▶ 浏览器│ │
+│            ▼                         │            │  └────────────────────────┘ │
+│                                      │            │            ▲                │
 │  subprocess.spawn(                   │            │            │ Show($toast)   │
 │    powershell.exe                    │  interop   │            │                │
 │    -EncodedCommand <UTF-16LE b64>    │───────────▶│  powershell.exe             │
@@ -39,11 +45,11 @@
 └──────────────────────────────────────┘            └─────────────────────────────┘
 ```
 
-1. DSH emits `agent/status` with `{ agent, status }` on every `idle ⇄ running` transition. `idle` = the task is done.
-2. The plugin keeps only transitions from **root agents** (`agents.roots()`), so subagent/workflow completions stay quiet.
-3. A PowerShell script is built that loads the WinRT `Windows.UI.Notifications` types, wraps title/body (XML-escaped) in a `ToastText02` toast XML and calls `Show()`.
+1. DSH emits `agent/status` with `{ agent, status }` on every `idle ⇄ running` transition. `idle` = the task is done. The `running` edge opens a per-agent stats window (start time, tool-call snapshot).
+2. The plugin keeps only transitions from **root agents** (`agents.roots()`), so subagent/workflow completions stay quiet. While the task runs it gathers stats from DSH events: `tools/result` (per-agent tool-call count), `agent/turn-stopping` (turn number), and `agent/error` (outcome + immediate error toast).
+3. A PowerShell script is built that loads the WinRT `Windows.UI.Notifications` types, wraps the session title (from the `sessionTitle` service) and the stats line (XML-escaped) in a `ToastGeneric` toast XML with a protocol-activation `launch`/button pointing at the DSH web UI, then calls `Show()`.
 4. The script is encoded as **base64 of UTF-16LE** (what `-EncodedCommand` expects — note the builtin `btoa` is UTF-8, so the plugin ships a tiny byte-level base64 encoder) and spawned via DSH's `subprocess` service: `powershell.exe -NoProfile -NonInteractive -EncodedCommand ...`.
-5. WSL interop translates the call onto Windows; the toast lands in the notification center with the default sound.
+5. WSL interop translates the call onto Windows; the toast lands in the notification center with the default (or IM, for errors) sound.
 
 ## Requirements
 
@@ -94,9 +100,11 @@ If a toast appears, the channel works and DSH will notify you on every task comp
 
 ## Behavior notes
 
-- **Notification text**: title `DeepSeek Harness`, body `任务已完成 [first 8 chars of session id]`.
+- **Completion toast**: title = the session's auto-generated title (fallback `DeepSeek Harness`); body = `任务已完成 · 第 N 轮 · 耗时 X 分 Y 秒 · 工具调用 N 次 · <model>` — each segment appears only when known.
+- **Error toast**: a separate alert fires immediately on `agent/error` (deduplicated to one per agent per 30 s). If the task ends in error, the completion toast says `任务结束（有错误）` and uses the IM sound instead of the default.
+- **Click-through**: both the toast body and its **打开 DSH** button open `http://127.0.0.1:3080` via protocol activation — edit `DSH_URL` in `host.js` if your DSH web UI listens on another port.
 - **Sender identity**: toasts are attributed to *Windows PowerShell* (the PowerShell 5.1 AUMID). To rebrand, register a dedicated AUMID (e.g. via a Start-menu shortcut) and replace `$appId` in the script.
-- **One per goal round**: each autonomous goal continuation round also ends in `idle`, so you get one toast per round — intentional, but easy to throttle if you prefer.
+- **One per goal round**: each autonomous goal continuation round also ends in `idle`, so you get one toast per round (with that round's own stats) — intentional, but easy to throttle if you prefer.
 - **Process-local lifetime**: like every dynamic plugin, it lives in the current DSH process. After a restart, activate it again — or mount it permanently in your agent preset composition.
 
 ## Troubleshooting
@@ -123,8 +131,11 @@ If a toast appears, the channel works and DSH will notify you on every task comp
 ## 特性
 
 - 监听 DSH 的 `agent/status` 事件，`idle`（任务结束、驱动静默）时触发通知，每轮任务恰好一次
+- **丰富统计**：每条完成通知包含会话标题、轮次、耗时、工具调用次数、模型名
+- **错误即时通知**：`agent/error` 触发时立刻弹独立通知（含错误信息，30 秒去重），任务结束时正文显示"任务结束（有错误）"并改用 IM 提示音
+- **点击跳转**：点击通知本体或"打开 DSH"按钮，直接浏览器打开 DSH 页面（protocol 激活）
 - 通过 `agents.roots()` 过滤子代理/工作流子任务，后台委托不会刷屏
-- 原生 Windows Toast（进通知中心、带默认提示音），Windows 侧**零依赖**：只用自带的 PowerShell 5.1 + WinRT
+- 原生 Windows Toast（进通知中心、带提示音），Windows 侧**零依赖**：只用自带的 PowerShell 5.1 + WinRT
 - 自动探测 `powershell.exe`，非 WSL 环境静默降级
 - 仅 Host 端，激活无需浏览器审批
 
