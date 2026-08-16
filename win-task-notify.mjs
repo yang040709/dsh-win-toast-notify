@@ -5,6 +5,9 @@
  * Host-only：消费宿主服务 `subprocess`、`agents`、`sessionTitle`，不发布任何服务，
  * 因此无需 isolate realm（同 `tool-bash` 的先例）。
  *
+ * v1.3.1：
+ * - 修复：声明 inject: ['subprocess', 'agents', 'sessionTitle']，冷启动时等待服务就绪后再 apply
+ *   （此前插件可能比服务更早加载，ctx.get 全部为 undefined 而永久静默）
  * v1.3.0：
  * - 修复：标题/正文里的单引号不再破坏 PowerShell 单引号字符串（'' 转义）
  * - 修复：剥离 XML 1.0 非法控制字符，避免 LoadXml 解析失败
@@ -34,6 +37,7 @@
 const lastNotified = new Map() // agentId -> epoch ms
 
 export default {
+  inject: ['subprocess', 'agents', 'sessionTitle'],
   apply(ctx) {
     const subprocess = ctx.get('subprocess')
     const agents = ctx.get('agents')

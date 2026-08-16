@@ -160,6 +160,7 @@ npm run check       # syntax check for both JS files + the shell script
 | `powershell.exe: not found` | WSL interop disabled (`WSL_INTEROP` empty) or `/mnt/c` not mounted — fix via `/etc/wsl.conf` (`interop=true`) |
 | Plugin logs "unavailable" | You are not on WSL2; this plugin targets WSL2 → Windows specifically |
 | Test script (or a raw `powershell.exe` call) hangs | WSL interop can keep waiting on an inherited stdin — use the current `scripts/test-toast.sh` (it redirects `</dev/null`), or call powershell with stdin closed |
+| Toast worked after hot-reload but not after a DSH restart | v1.3.1 fix: the plugin now declares `inject` for `subprocess`/`agents`/`sessionTitle`, so it waits for those services on cold boot instead of applying too early and staying silent |
 | Toast shows wrong encoding | Ensure the script goes through the UTF-16LE base64 path; don't replace it with plain UTF-8 `btoa` |
 
 ## License

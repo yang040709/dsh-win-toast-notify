@@ -14,6 +14,8 @@
  * - v1.3.0: XML/PowerShell escaping (apostrophes, special and illegal XML
  *   characters), 15 s spawn timeout, per-agent state cleanup on agent/disposed,
  *   and turn numbers only reported for turns that actually completed this run.
+ * - v1.3.1: declares inject dependencies (subprocess/agents/sessionTitle) so the
+ *   plugin waits for those services instead of silently giving up on cold boot.
  *
  * USAGE in DSH:
  *   Paste the body of the exported function below as the `code.host` value of
@@ -21,6 +23,7 @@
  *   returned packageId with `cordis_run`.
  */
 return {
+  inject: ['subprocess', 'agents', 'sessionTitle'],
   apply(ctx) {
     const subprocess = ctx.get('subprocess')
     const agents = ctx.get('agents')

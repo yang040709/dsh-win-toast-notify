@@ -116,6 +116,10 @@ function assertWellFormedXml(xml) {
 async function tick() { await new Promise((resolve) => setImmediate(resolve)) }
 
 for (const [name, plugin] of [['host.js', loadHostPlugin()], ['win-task-notify.mjs', persistentPlugin]]) {
+  test(`${name}: declares its service dependencies so apply waits for them`, () => {
+    assert.deepEqual(plugin.inject, ['subprocess', 'agents', 'sessionTitle'])
+  })
+
   test(`${name}: applies without required services and stays silent`, () => {
     const ctx = { get: () => undefined, on: () => () => true }
     assert.doesNotThrow(() => plugin.apply(ctx))
