@@ -5,6 +5,7 @@
   "description": "DeepSeek Harness (DSH) dynamic Cordis plugin: Windows native toast notification when an agent task completes (WSL2).",
   "keywords": [
     "dsh",
+    "dsh-plugin",
     "deepseek-harness",
     "cordis",
     "plugin",
