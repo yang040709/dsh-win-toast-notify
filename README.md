@@ -89,27 +89,36 @@ The plugin is **Host-only**, so it activates without any Client approval step. O
 [win-task-notify] powershell.exe resolved to /mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe
 ```
 
-### Option C — Persistent mount (survives DSH restart, recommended)
+### Option C — Persistent host mount via profile patch layer (survives restart, recommended)
 
-[`win-task-notify.mjs`](win-task-notify.mjs) is the same plugin as a proper ESM module for composition rows. Mount it in your agent preset and it loads automatically with every session:
+[`win-task-notify.mjs`](win-task-notify.mjs) is the same plugin as a proper ESM module for composition rows. Mount it through your **profile's user patch layer** — no agent preset involved, one host-level instance for the whole process, loaded automatically on every boot:
 
-1. Copy the file into your preset directory:
+1. Copy the file into your profile directory:
 
    ```
-   ${DSH_HOME:-~/.dsh}/.agent-presets/<preset-id>/plugins/win-task-notify.mjs
+   ${DSH_HOME:-~/.dsh}/profiles/<profile>/plugins/win-task-notify.mjs
    ```
 
-2. Add one row at the end of that preset's `agent.cordis.yml` (relative names resolve against the preset directory):
+2. Append one insert block to the profile's `cordis.patch.yml` (relative row names resolve against the profile directory):
 
    ```yaml
-   # 消费宿主服务 subprocess/agents/sessionTitle，不发布任何服务 → 无需 isolate realm
-   - id: plugin-win-task-notify
-     name: ./plugins/win-task-notify.mjs
+   # 宿主级插件：消费 subprocess/agents/sessionTitle，不发布服务 → 无需 isolate realm
+   - insert:
+       - id: plugin-win-task-notify
+         name: ./plugins/win-task-notify.mjs
    ```
 
-3. Mount-validate the preset with `agentPresets.standingKeyFor('<preset-id>')` (or have a DSH agent do it), then restart DSH. Every session on that preset now notifies without any manual activation.
+3. Validate the composed tree offline, then restart DSH:
 
-Note: dynamic plugins (Options A/B) live only in the current process; after a DSH restart they are gone, while the preset row loads again automatically. To change what a shipped preset does, copy the preset first (never edit the shipped install) and edit the copy.
+   ```bash
+   dsh --profile <profile> --dump-config   # the row must appear at the root
+   ```
+
+   The profile patch layer is also hot-reloaded on long-lived surfaces, so a restart may not even be needed.
+
+*Alternative:* mount the same file inside an agent preset (`${DSH_HOME}/.agent-presets/<preset-id>/plugins/` + a row in its `agent.cordis.yml`) — one instance per session. To change what a shipped preset does, copy the preset first (never edit the shipped install) and edit the copy.
+
+Note: dynamic plugins (Options A/B) live only in the current process; after a DSH restart they are gone, while the profile patch row loads again automatically.
 
 ## Verification
 
@@ -169,30 +178,32 @@ DSH（WSL2 内）监听 `agent/status` → 根 agent 进入 `idle` → 构造 Po
 
 ## 安装（DSH 内）
 
-两种方式：**动态插件**（仅当前进程有效）或**预设持久化挂载**（随 DSH 重启自动生效，推荐）。
+两种方式：**动态插件**（仅当前进程有效）或 **profile 补丁层持久化挂载**（宿主级，随 DSH 重启自动生效，不依赖预设，推荐）。
 
 1. 打开 DSH 的动态插件面板（或使用 `cordis_define` 工具）
 2. 新建插件（id 前缀如 `winntf`），把 [`host.js`](host.js) 中注释块之后的函数体粘贴到 **Host** 代码框（Client 留空）
 3. 激活即可；本轮任务结束时你就会收到第一条通知
 
-**持久化挂载（重启后依然自动生效）**：
+**持久化挂载（profile 补丁层，重启后依然自动生效）**：
 
-1. 把 [`win-task-notify.mjs`](win-task-notify.mjs) 复制到你的 preset 目录：
+1. 把 [`win-task-notify.mjs`](win-task-notify.mjs) 复制到你的 profile 目录：
 
    ```
-   ${DSH_HOME:-~/.dsh}/.agent-presets/<preset-id>/plugins/win-task-notify.mjs
+   ${DSH_HOME:-~/.dsh}/profiles/<profile>/plugins/win-task-notify.mjs
    ```
 
-2. 在该 preset 的 `agent.cordis.yml` 末尾加一行（相对路径相对 preset 目录解析）：
+2. 在该 profile 的 `cordis.patch.yml` 中追加（相对路径相对 profile 目录解析）：
 
    ```yaml
-   - id: plugin-win-task-notify
-     name: ./plugins/win-task-notify.mjs
+   # 宿主级插件：消费 subprocess/agents/sessionTitle，不发布服务 → 无需 isolate realm
+   - insert:
+       - id: plugin-win-task-notify
+         name: ./plugins/win-task-notify.mjs
    ```
 
-3. 用 `agentPresets.standingKeyFor('<preset-id>')` 挂载验证后重启 DSH，之后每个挂载该 preset 的会话自动生效，无需手动激活。
+3. 用 `dsh --profile <profile> --dump-config` 校验组合树（该行必须出现在根级），然后重启 DSH（profile 补丁层在长驻进程上支持热重载，可能无需重启）。
 
-> 修改内置（shipped）preset 前请先复制副本再改副本，不要直接改部署自带的预设。
+*备选*：agent preset 挂载（每个会话一份实例）——同文件放进 `${DSH_HOME}/.agent-presets/<preset-id>/plugins/` 并在该 preset 的 `agent.cordis.yml` 末尾加同名行；修改内置 preset 前请先复制副本再改副本。
 
 ## 验证
 

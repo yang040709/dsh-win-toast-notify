@@ -1,7 +1,7 @@
 /**
  * win-task-notify — 任务完成时弹 Windows 原生 Toast（WSL → PowerShell WinRT）。
  *
- * 静态持久化插件（agent preset 组合行，随 DSH 重启自动生效）。
+ * 静态持久化插件（宿主级组合行，随 DSH 重启自动生效）。
  * Host-only：消费宿主服务 `subprocess`、`agents`、`sessionTitle`，不发布任何服务，
  * 因此无需 isolate realm（同 `tool-bash` 的先例）。
  *
@@ -10,13 +10,19 @@
  * - agent/error 即时错误通知（每 agent 30 秒去重），结束通知标注"任务结束（有错误）"并换 IM 音
  * - 点击通知或"打开 DSH"按钮 → 浏览器打开 DSH（protocol 激活）
  *
- * 安装（持久化，随 DSH 重启自动生效）：
- *   1. 把本文件复制到你的 agent preset 目录，如
- *      ${DSH_HOME}/.agent-presets/<preset-id>/plugins/win-task-notify.mjs
- *   2. 在该 preset 的 agent.cordis.yml 末尾加一行：
- *        - id: plugin-win-task-notify
- *          name: ./plugins/win-task-notify.mjs
- *   3. 用 agentPresets.standingKeyFor('<preset-id>') 挂载验证，然后重启 DSH。
+ * 安装（推荐：profile 补丁层，宿主级，随 DSH 重启自动生效，不依赖预设）：
+ *   1. 把本文件复制到你的 profile 目录：
+ *      ${DSH_HOME:-~/.dsh}/profiles/<profile>/plugins/win-task-notify.mjs
+ *   2. 在该 profile 的 cordis.patch.yml 中追加：
+ *        - insert:
+ *            - id: plugin-win-task-notify
+ *              name: ./plugins/win-task-notify.mjs
+ *   3. 用 `dsh --profile <profile> --dump-config` 校验组合树，然后重启 DSH
+ *      （profile 补丁层在长驻进程上支持热重载）。
+ *
+ * 备选：agent preset 挂载（每个会话一份实例）——把本文件放进
+ *   ${DSH_HOME}/.agent-presets/<preset-id>/plugins/ 并在该 preset 的
+ *   agent.cordis.yml 末尾加一行同 name 的行。
  *
  * 模块级 1 秒去重：同一进程内多个会话挂载本 preset 时，同一 agent 连续 idle 事件不会重复弹窗。
  */
