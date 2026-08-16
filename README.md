@@ -131,6 +131,15 @@ chmod +x scripts/test-toast.sh
 
 If a toast appears, the channel works and DSH will notify you on every task completion.
 
+### Automated tests
+
+The event logic of both variants (`host.js` and `win-task-notify.mjs`) is covered by a dependency-free Node test suite that mocks the DSH services:
+
+```bash
+npm test            # node --test test/plugin.test.mjs
+npm run check       # syntax check for both JS files + the shell script
+```
+
 ## Behavior notes
 
 - **Completion toast**: title = the session's auto-generated title (fallback `DeepSeek Harness`); body = `任务已完成 · 第 N 轮 · 耗时 X 分 Y 秒 · 工具调用 N 次 · <model>` — each segment appears only when known.
@@ -138,6 +147,9 @@ If a toast appears, the channel works and DSH will notify you on every task comp
 - **Click-through**: both the toast body and its **打开 DSH** button open `http://127.0.0.1:3080` via protocol activation — edit `DSH_URL` in `host.js` if your DSH web UI listens on another port.
 - **Sender identity**: toasts are attributed to *Windows PowerShell* (the PowerShell 5.1 AUMID). To rebrand, register a dedicated AUMID (e.g. via a Start-menu shortcut) and replace `$appId` in the script.
 - **One per goal round**: each autonomous goal continuation round also ends in `idle`, so you get one toast per round (with that round's own stats) — intentional, but easy to throttle if you prefer.
+- **Robust text handling**: titles/error messages are XML-escaped, invalid XML 1.0 control characters are replaced, and apostrophes are doubled for the PowerShell single-quoted string — so `It's done`, `<tags>` and `&`-signs all toast correctly.
+- **No stuck child processes**: each `powershell.exe` spawn is aborted after 15 s, so a hung WSL interop call cannot leak a managed child forever. Per-agent state is cleaned up on `agent/disposed`.
+- **Turn accuracy**: the completion toast only reports a turn number that actually completed during that run; a run that failed before `agent/turn-stopping` no longer reuses the previous run's number.
 - **Process-local lifetime**: like every dynamic plugin, it lives in the current DSH process. After a restart, activate it again — or mount it permanently in your agent preset composition.
 
 ## Troubleshooting
@@ -147,6 +159,7 @@ If a toast appears, the channel works and DSH will notify you on every task comp
 | No toast, but script exits 0 | Windows notification settings: allow *Windows PowerShell* to show notifications; also check Focus Assist / Do Not Disturb |
 | `powershell.exe: not found` | WSL interop disabled (`WSL_INTEROP` empty) or `/mnt/c` not mounted — fix via `/etc/wsl.conf` (`interop=true`) |
 | Plugin logs "unavailable" | You are not on WSL2; this plugin targets WSL2 → Windows specifically |
+| Test script (or a raw `powershell.exe` call) hangs | WSL interop can keep waiting on an inherited stdin — use the current `scripts/test-toast.sh` (it redirects `</dev/null`), or call powershell with stdin closed |
 | Toast shows wrong encoding | Ensure the script goes through the UTF-16LE base64 path; don't replace it with plain UTF-8 `btoa` |
 
 ## License

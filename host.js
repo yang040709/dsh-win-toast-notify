@@ -11,6 +11,9 @@
  *   model name; click (or the 打开 DSH button) opens the DSH web UI.
  * - Immediate error toast on agent/error (30 s dedup per agent).
  * - Root-agent filter: subagents and workflow children stay quiet.
+ * - v1.3.0: XML/PowerShell escaping (apostrophes, special and illegal XML
+ *   characters), 15 s spawn timeout, per-agent state cleanup on agent/disposed,
+ *   and turn numbers only reported for turns that actually completed this run.
  *
  * USAGE in DSH:
  *   Paste the body of the exported function below as the `code.host` value of
@@ -100,14 +103,45 @@ return {
         .replace(/"/g, '&quot;')
     }
 
+    // XML 1.0 does not allow most C0 control characters or lone surrogates;
+    // PowerShell's XmlDocument.LoadXml throws on them. Replace them instead
+    // of letting one malformed title/error message disable the notification.
+    function xmlSafe(value) {
+      let out = ''
+      for (const ch of String(value)) {
+        const cp = ch.codePointAt(0)
+        if (cp === 0x9 || cp === 0xa || cp === 0xd ||
+            (cp >= 0x20 && cp <= 0xd7ff) ||
+            (cp >= 0xe000 && cp <= 0xfffd) ||
+            (cp >= 0x10000 && cp <= 0x10ffff)) {
+          out += ch
+        } else {
+          out += '\ufffd'
+        }
+      }
+      return out
+    }
+
+    // The toast XML is embedded in a PowerShell SINGLE-quoted string, so a
+    // literal apostrophe must be doubled (''); otherwise "It's done" ends the
+    // string early and PowerShell fails to parse the script.
+    function psSingleQuoted(value) {
+      return String(value).replace(/'/g, "''")
+    }
+
+    function toastText(value) {
+      return psSingleQuoted(xmlEscape(xmlSafe(value)))
+    }
+
     // ToastGeneric template: bold title + body, click-through to DSH, action button.
     function buildScript(title, body, sound) {
+      const launch = toastText(DSH_URL)
       return [
         '[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null',
         "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null",
         "$appId = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe'",
         '$xml = New-Object Windows.Data.Xml.Dom.XmlDocument',
-        "$xml.LoadXml('<toast activationType=\"protocol\" launch=\"" + DSH_URL + "\"><visual><binding template=\"ToastGeneric\"><text id=\"1\">" + xmlEscape(title) + "</text><text id=\"2\">" + xmlEscape(body) + "</text></binding></visual><audio src=\"" + sound + "\"/><actions><action content=\"打开 DSH\" activationType=\"protocol\" arguments=\"" + DSH_URL + "\"/></actions></toast>')",
+        "$xml.LoadXml('<toast activationType=\"protocol\" launch=\"" + launch + "\"><visual><binding template=\"ToastGeneric\"><text id=\"1\">" + toastText(title) + "</text><text id=\"2\">" + toastText(body) + "</text></binding></visual><audio src=\"" + sound + "\"/><actions><action content=\"打开 DSH\" activationType=\"protocol\" arguments=\"" + launch + "\"/></actions></toast>')",
         '$toast = New-Object Windows.UI.Notifications.ToastNotification $xml',
         "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show($toast)",
       ].join('\n')
@@ -117,6 +151,10 @@ return {
       if (psPath === null) return
       const sound = kind === 'error' ? 'ms-winsoundevent:Notification.IM' : 'ms-winsoundevent:Notification.Default'
       const b64 = bytesToBase64(utf16leBytes(buildScript(title, body, sound)))
+      // A stuck powershell.exe must not leak a managed child forever: abort
+      // the spawn after 15 s and let the subprocess service terminate it.
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), 15000)
       try {
         const handle = subprocess.spawn({
           argv: [psPath, '-NoProfile', '-NonInteractive', '-EncodedCommand', b64],
@@ -127,11 +165,17 @@ return {
             stderr: { maxBytes: 4096 },
           },
           graceMs: 15000,
+          signal: controller.signal,
         })
-        handle.done.catch((err) => {
-          console.error('[win-task-notify] toast process failed:', err)
-        })
+        handle.done
+          .catch((err) => {
+            console.error('[win-task-notify] toast process failed:', err)
+          })
+          .finally(() => {
+            clearTimeout(timer)
+          })
       } catch (err) {
+        clearTimeout(timer)
         console.error('[win-task-notify] spawn failed:', err)
       }
     }
@@ -162,6 +206,17 @@ return {
       const agent = payload && payload.agent
       if (agent === undefined) return
       if (typeof payload.turn === 'number') lastTurn.set(String(agent.id), payload.turn)
+    })
+
+    // Drop per-agent state when the agent is removed from the registry.
+    ctx.on('agent/disposed', (payload) => {
+      const agent = payload && payload.agent
+      if (agent === undefined) return
+      const id = String(agent.id)
+      perAgent.delete(id)
+      toolCounts.delete(id)
+      lastTurn.delete(id)
+      lastErrorToast.delete(id)
     })
 
     // Immediate error notification for root agents (30s dedup per agent).
@@ -198,7 +253,12 @@ return {
       const status = payload.status
 
       if (status === 'running') {
-        perAgent.set(id, { startedAt: now(), toolsStart: toolCounts.get(id) || 0, errored: false })
+        perAgent.set(id, {
+          startedAt: now(),
+          toolsStart: toolCounts.get(id) || 0,
+          turnStart: lastTurn.get(id),
+          errored: false,
+        })
         return
       }
       if (status !== 'idle') return
@@ -210,8 +270,10 @@ return {
       const title = titleOf(agent) || 'DeepSeek Harness'
       const outcome = st.errored ? '任务结束（有错误）' : '任务已完成'
       const parts = [outcome]
+      // Only report a turn that actually completed during THIS run; if the
+      // run failed before agent/turn-stopping, don't reuse the previous run.
       const turn = lastTurn.get(id)
-      if (typeof turn === 'number') parts.push('第 ' + turn + ' 轮')
+      if (typeof turn === 'number' && turn !== st.turnStart) parts.push('第 ' + turn + ' 轮')
       if (st.startedAt > 0) {
         const dur = fmtDuration(now() - st.startedAt)
         if (dur) parts.push('耗时 ' + dur)

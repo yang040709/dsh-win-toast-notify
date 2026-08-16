@@ -5,10 +5,14 @@
  * Host-only：消费宿主服务 `subprocess`、`agents`、`sessionTitle`，不发布任何服务，
  * 因此无需 isolate realm（同 `tool-bash` 的先例）。
  *
- * v1.1.0 功能：
- * - 完成通知：会话标题 + 第 N 轮 + 耗时 + 工具调用次数 + 模型名
- * - agent/error 即时错误通知（每 agent 30 秒去重），结束通知标注"任务结束（有错误）"并换 IM 音
- * - 点击通知或"打开 DSH"按钮 → 浏览器打开 DSH（protocol 激活）
+ * v1.3.0：
+ * - 修复：标题/正文里的单引号不再破坏 PowerShell 单引号字符串（'' 转义）
+ * - 修复：剥离 XML 1.0 非法控制字符，避免 LoadXml 解析失败
+ * - 修复：powershell.exe 卡住时 15 秒后中止，不泄漏托管子进程
+ * - 修复：agent 销毁时清理状态；任务未完成任何轮次时不再沿用上一轮轮次号
+ * - v1.1.0 功能：完成通知（会话标题 + 第 N 轮 + 耗时 + 工具调用次数 + 模型名），
+ *   agent/error 即时错误通知（每 agent 30 秒去重），结束通知标注"任务结束（有错误）"并换 IM 音，
+ *   点击通知或"打开 DSH"按钮 → 浏览器打开 DSH（protocol 激活）
  *
  * 安装（推荐：profile 补丁层，宿主级，随 DSH 重启自动生效，不依赖预设）：
  *   1. 把本文件复制到你的 profile 目录：
@@ -112,14 +116,43 @@ export default {
         .replace(/"/g, '&quot;')
     }
 
+    // XML 1.0 不允许大多数 C0 控制字符和孤立代理项，XmlDocument.LoadXml 会抛错；
+    // 这里替换掉它们，避免一个畸形标题/错误信息让整条通知失效。
+    function xmlSafe(value) {
+      let out = ''
+      for (const ch of String(value)) {
+        const cp = ch.codePointAt(0)
+        if (cp === 0x9 || cp === 0xa || cp === 0xd ||
+            (cp >= 0x20 && cp <= 0xd7ff) ||
+            (cp >= 0xe000 && cp <= 0xfffd) ||
+            (cp >= 0x10000 && cp <= 0x10ffff)) {
+          out += ch
+        } else {
+          out += '\ufffd'
+        }
+      }
+      return out
+    }
+
+    // Toast XML 嵌在 PowerShell 的单引号字符串里：单引号必须翻倍（''），
+    // 否则 "It's done" 会提前结束字符串导致 PowerShell 解析失败。
+    function psSingleQuoted(value) {
+      return String(value).replace(/'/g, "''")
+    }
+
+    function toastText(value) {
+      return psSingleQuoted(xmlEscape(xmlSafe(value)))
+    }
+
     // ToastGeneric 模板：加粗标题 + 正文，点击跳转 DSH，附带操作按钮。
     function buildScript(title, body, sound) {
+      const launch = toastText(DSH_URL)
       return [
         '[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null',
         "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null",
         "$appId = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe'",
         '$xml = New-Object Windows.Data.Xml.Dom.XmlDocument',
-        "$xml.LoadXml('<toast activationType=\"protocol\" launch=\"" + DSH_URL + "\"><visual><binding template=\"ToastGeneric\"><text id=\"1\">" + xmlEscape(title) + "</text><text id=\"2\">" + xmlEscape(body) + "</text></binding></visual><audio src=\"" + sound + "\"/><actions><action content=\"打开 DSH\" activationType=\"protocol\" arguments=\"" + DSH_URL + "\"/></actions></toast>')",
+        "$xml.LoadXml('<toast activationType=\"protocol\" launch=\"" + launch + "\"><visual><binding template=\"ToastGeneric\"><text id=\"1\">" + toastText(title) + "</text><text id=\"2\">" + toastText(body) + "</text></binding></visual><audio src=\"" + sound + "\"/><actions><action content=\"打开 DSH\" activationType=\"protocol\" arguments=\"" + launch + "\"/></actions></toast>')",
         '$toast = New-Object Windows.UI.Notifications.ToastNotification $xml',
         "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show($toast)",
       ].join('\n')
@@ -129,6 +162,10 @@ export default {
       if (psPath === null) return
       const sound = kind === 'error' ? 'ms-winsoundevent:Notification.IM' : 'ms-winsoundevent:Notification.Default'
       const b64 = bytesToBase64(utf16leBytes(buildScript(title, body, sound)))
+      // powershell.exe 卡住时不能让托管子进程永久泄漏：15 秒后中止，
+      // 由 subprocess 服务按 graceMs 升级终止整个进程树。
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), 15000)
       try {
         const handle = subprocess.spawn({
           argv: [psPath, '-NoProfile', '-NonInteractive', '-EncodedCommand', b64],
@@ -139,11 +176,17 @@ export default {
             stderr: { maxBytes: 4096 },
           },
           graceMs: 15000,
+          signal: controller.signal,
         })
-        handle.done.catch((err) => {
-          console.error('[win-task-notify] toast process failed:', err)
-        })
+        handle.done
+          .catch((err) => {
+            console.error('[win-task-notify] toast process failed:', err)
+          })
+          .finally(() => {
+            clearTimeout(timer)
+          })
       } catch (err) {
+        clearTimeout(timer)
         console.error('[win-task-notify] spawn failed:', err)
       }
     }
@@ -193,6 +236,18 @@ export default {
       if (typeof payload.turn === 'number') lastTurn.set(String(agent.id), payload.turn)
     })
 
+    // agent 从注册表移除时清掉该 agent 的全部内存状态。
+    ctx.on('agent/disposed', (payload) => {
+      const agent = payload && payload.agent
+      if (agent === undefined) return
+      const id = String(agent.id)
+      perAgent.delete(id)
+      toolCounts.delete(id)
+      lastTurn.delete(id)
+      lastErrorToast.delete(id)
+      lastNotified.delete(id)
+    })
+
     // 根 agent 出错时即时通知（每 agent 30 秒去重）。
     ctx.on('agent/error', (payload) => {
       const agent = payload && payload.agent
@@ -226,7 +281,12 @@ export default {
       const status = payload.status
 
       if (status === 'running') {
-        perAgent.set(id, { startedAt: now(), toolsStart: toolCounts.get(id) || 0, errored: false })
+        perAgent.set(id, {
+          startedAt: now(),
+          toolsStart: toolCounts.get(id) || 0,
+          turnStart: lastTurn.get(id),
+          errored: false,
+        })
         return
       }
       if (status !== 'idle') return
@@ -239,8 +299,10 @@ export default {
       const title = titleOf(agent) || 'DeepSeek Harness'
       const outcome = st.errored ? '任务结束（有错误）' : '任务已完成'
       const parts = [outcome]
+      // 只报告本次运行期间真正完成的轮次；运行在 turn-stopping 之前就失败时，
+      // 不要沿用上一轮的旧轮次号。
       const turn = lastTurn.get(id)
-      if (typeof turn === 'number') parts.push('第 ' + turn + ' 轮')
+      if (typeof turn === 'number' && turn !== st.turnStart) parts.push('第 ' + turn + ' 轮')
       if (st.startedAt > 0) {
         const dur = fmtDuration(now() - st.startedAt)
         if (dur) parts.push('耗时 ' + dur)
