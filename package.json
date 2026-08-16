@@ -1,6 +1,6 @@
 {
   "name": "dsh-win-toast-notify",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "description": "DeepSeek Harness (DSH) dynamic Cordis plugin: Windows native toast notification when an agent task completes (WSL2).",
   "keywords": [
@@ -17,6 +17,7 @@
   "license": "MIT",
   "files": [
     "host.js",
+    "win-task-notify.mjs",
     "scripts"
   ]
 }

@@ -1,0 +1,252 @@
+/**
+ * win-task-notify — 任务完成时弹 Windows 原生 Toast（WSL → PowerShell WinRT）。
+ *
+ * 静态持久化插件（agent preset 组合行，随 DSH 重启自动生效）。
+ * Host-only：消费宿主服务 `subprocess`、`agents`、`sessionTitle`，不发布任何服务，
+ * 因此无需 isolate realm（同 `tool-bash` 的先例）。
+ *
+ * v1.1.0 功能：
+ * - 完成通知：会话标题 + 第 N 轮 + 耗时 + 工具调用次数 + 模型名
+ * - agent/error 即时错误通知（每 agent 30 秒去重），结束通知标注"任务结束（有错误）"并换 IM 音
+ * - 点击通知或"打开 DSH"按钮 → 浏览器打开 DSH（protocol 激活）
+ *
+ * 安装（持久化，随 DSH 重启自动生效）：
+ *   1. 把本文件复制到你的 agent preset 目录，如
+ *      ${DSH_HOME}/.agent-presets/<preset-id>/plugins/win-task-notify.mjs
+ *   2. 在该 preset 的 agent.cordis.yml 末尾加一行：
+ *        - id: plugin-win-task-notify
+ *          name: ./plugins/win-task-notify.mjs
+ *   3. 用 agentPresets.standingKeyFor('<preset-id>') 挂载验证，然后重启 DSH。
+ *
+ * 模块级 1 秒去重：同一进程内多个会话挂载本 preset 时，同一 agent 连续 idle 事件不会重复弹窗。
+ */
+
+const lastNotified = new Map() // agentId -> epoch ms
+
+export default {
+  apply(ctx) {
+    const subprocess = ctx.get('subprocess')
+    const agents = ctx.get('agents')
+    const sessionTitle = ctx.get('sessionTitle')
+    if (subprocess === undefined) return
+
+    // 若你的 DSH Web UI 监听其它端口，请修改这里。
+    const DSH_URL = 'http://127.0.0.1:3080'
+    let psPath = null
+
+    // 每个根 agent 的任务统计：id -> { startedAt, toolsStart, errored }
+    const perAgent = new Map()
+    const toolCounts = new Map() // id -> 生命周期累计工具调用次数
+    const lastTurn = new Map() // id -> 最近完成的轮次号
+    const lastErrorToast = new Map() // id -> 上次错误通知时间戳
+
+    // --- 工具函数 -----------------------------------------------------------
+    function now() {
+      try { return Date.now() } catch (err) { return 0 }
+    }
+
+    function fmtDuration(ms) {
+      if (!ms || ms < 0) return ''
+      const s = Math.round(ms / 1000)
+      if (s < 60) return s + ' 秒'
+      const m = Math.floor(s / 60)
+      return m + ' 分 ' + (s % 60) + ' 秒'
+    }
+
+    function truncate(str, max) {
+      const s = String(str)
+      return s.length > max ? s.slice(0, max) + '…' : s
+    }
+
+    function titleOf(agent) {
+      try {
+        if (sessionTitle === undefined || agent === undefined) return ''
+        const snap = sessionTitle.get(agent.session)
+        if (snap && typeof snap.title === 'string') return truncate(snap.title, 40)
+      } catch (err) {
+        // 标题获取失败时回退
+      }
+      return ''
+    }
+
+    function isRoot(agent) {
+      if (agents === undefined || agent === undefined) return true
+      try { return agents.roots().includes(agent) } catch (err) { return true }
+    }
+
+    function bytesToBase64(bytes) {
+      const map = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+      let out = ''
+      for (let i = 0; i < bytes.length; i += 3) {
+        const a = bytes[i]
+        const b = i + 1 < bytes.length ? bytes[i + 1] : 0
+        const c = i + 2 < bytes.length ? bytes[i + 2] : 0
+        out += map[a >> 2] + map[((a & 3) << 4) | (b >> 4)]
+        out += i + 1 < bytes.length ? map[((b & 15) << 2) | (c >> 6)] : '='
+        out += i + 2 < bytes.length ? map[c & 63] : '='
+      }
+      return out
+    }
+
+    // PowerShell -EncodedCommand 要求 UTF-16LE 字节的 base64。
+    function utf16leBytes(str) {
+      const bytes = []
+      for (let i = 0; i < str.length; i++) {
+        const code = str.charCodeAt(i)
+        bytes.push(code & 0xff, (code >> 8) & 0xff)
+      }
+      return bytes
+    }
+
+    function xmlEscape(value) {
+      return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+    }
+
+    // ToastGeneric 模板：加粗标题 + 正文，点击跳转 DSH，附带操作按钮。
+    function buildScript(title, body, sound) {
+      return [
+        '[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null',
+        "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null",
+        "$appId = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe'",
+        '$xml = New-Object Windows.Data.Xml.Dom.XmlDocument',
+        "$xml.LoadXml('<toast activationType=\"protocol\" launch=\"" + DSH_URL + "\"><visual><binding template=\"ToastGeneric\"><text id=\"1\">" + xmlEscape(title) + "</text><text id=\"2\">" + xmlEscape(body) + "</text></binding></visual><audio src=\"" + sound + "\"/><actions><action content=\"打开 DSH\" activationType=\"protocol\" arguments=\"" + DSH_URL + "\"/></actions></toast>')",
+        '$toast = New-Object Windows.UI.Notifications.ToastNotification $xml',
+        "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show($toast)",
+      ].join('\n')
+    }
+
+    function fireToast(title, body, kind) {
+      if (psPath === null) return
+      const sound = kind === 'error' ? 'ms-winsoundevent:Notification.IM' : 'ms-winsoundevent:Notification.Default'
+      const b64 = bytesToBase64(utf16leBytes(buildScript(title, body, sound)))
+      try {
+        const handle = subprocess.spawn({
+          argv: [psPath, '-NoProfile', '-NonInteractive', '-EncodedCommand', b64],
+          cwd: '/',
+          stdio: {
+            stdin: 'ignore',
+            stdout: { maxBytes: 1024 },
+            stderr: { maxBytes: 4096 },
+          },
+          graceMs: 15000,
+        })
+        handle.done.catch((err) => {
+          console.error('[win-task-notify] toast process failed:', err)
+        })
+      } catch (err) {
+        console.error('[win-task-notify] spawn failed:', err)
+      }
+    }
+
+    // 模块级 1 秒去重（同一进程内多个会话挂载本 preset 时防重复弹窗）。
+    function dedup(agent) {
+      const t = now()
+      if (t === 0) return true
+      let key = 'unknown'
+      try { key = String(agent && agent.id) } catch (err) { /* ignore */ }
+      const last = lastNotified.get(key)
+      if (typeof last === 'number' && t - last < 1000) return false
+      lastNotified.set(key, t)
+      if (lastNotified.size > 64) {
+        for (const k of Array.from(lastNotified.keys())) {
+          const v = lastNotified.get(k)
+          if (typeof v === 'number' && t - v > 1000) lastNotified.delete(k)
+        }
+      }
+      return true
+    }
+
+    // --- 特性探测：WSL 互操作下的 powershell.exe（非 WSL 环境静默禁用）------
+    subprocess.resolveExecutable('powershell.exe')
+      .then((path) => {
+        psPath = path
+        console.log('[win-task-notify] powershell.exe resolved to', path)
+      })
+      .catch((err) => {
+        console.error('[win-task-notify] powershell.exe unavailable, notifications disabled:', err)
+      })
+
+    // --- 数据采集 ------------------------------------------------------------
+
+    // 按 agent 统计工具调用次数（exec.agent 由 agent loop 设置）。
+    ctx.on('tools/result', (exec) => {
+      const agent = exec && exec.agent
+      if (agent === undefined) return
+      const id = String(agent.id)
+      toolCounts.set(id, (toolCounts.get(id) || 0) + 1)
+    })
+
+    // 记录每个 agent 最近完成的轮次号。
+    ctx.on('agent/turn-stopping', (payload) => {
+      const agent = payload && payload.agent
+      if (agent === undefined) return
+      if (typeof payload.turn === 'number') lastTurn.set(String(agent.id), payload.turn)
+    })
+
+    // 根 agent 出错时即时通知（每 agent 30 秒去重）。
+    ctx.on('agent/error', (payload) => {
+      const agent = payload && payload.agent
+      if (!isRoot(agent)) return
+      const id = String(agent.id)
+      const st = perAgent.get(id)
+      if (st !== undefined) st.errored = true
+      const t = now()
+      const last = lastErrorToast.get(id) || 0
+      if (t > 0 && t - last < 30000) return
+      lastErrorToast.set(id, t)
+      let msg = '未知错误'
+      try {
+        const e = payload.error
+        if (e && typeof e === 'object' && typeof e.message === 'string') msg = String(e.message)
+        else if (e !== undefined && e !== null) msg = String(e)
+      } catch (err) {
+        // 保留默认文案
+      }
+      const prefix = typeof payload.turn === 'number' ? '第 ' + payload.turn + ' 轮 · ' : ''
+      fireToast('DeepSeek Harness · 任务出错', prefix + truncate(msg, 120), 'error')
+    })
+
+    // --- 任务完成触发 --------------------------------------------------------
+
+    // agent/status 在 idle ⇄ running 切换时触发；`idle` 表示无剩余调度，即任务结束。
+    ctx.on('agent/status', (payload) => {
+      const agent = payload && payload.agent
+      if (!isRoot(agent)) return
+      const id = String(agent.id)
+      const status = payload.status
+
+      if (status === 'running') {
+        perAgent.set(id, { startedAt: now(), toolsStart: toolCounts.get(id) || 0, errored: false })
+        return
+      }
+      if (status !== 'idle') return
+
+      const st = perAgent.get(id)
+      if (st === undefined) return
+      perAgent.delete(id)
+      if (!dedup(agent)) return
+
+      const title = titleOf(agent) || 'DeepSeek Harness'
+      const outcome = st.errored ? '任务结束（有错误）' : '任务已完成'
+      const parts = [outcome]
+      const turn = lastTurn.get(id)
+      if (typeof turn === 'number') parts.push('第 ' + turn + ' 轮')
+      if (st.startedAt > 0) {
+        const dur = fmtDuration(now() - st.startedAt)
+        if (dur) parts.push('耗时 ' + dur)
+      }
+      parts.push('工具调用 ' + ((toolCounts.get(id) || 0) - st.toolsStart) + ' 次')
+      try {
+        const model = agent.options && agent.options.model
+        if (typeof model === 'string' && model) parts.push(model)
+      } catch (err) {
+        // 模型名为可选字段
+      }
+      fireToast(title, parts.join(' · '), st.errored ? 'error' : 'ok')
+    })
+  },
+}

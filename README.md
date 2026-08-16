@@ -62,6 +62,8 @@
 
 ## Installation
 
+Two ways to install: a **dynamic plugin** for the current process (Options A/B), or a **persistent mount** in an agent preset that survives DSH restarts (Option C, recommended).
+
 This plugin is a **dynamic Cordis plugin** for a running DSH process. Paste [`host.js`](host.js) as the Host code and activate it.
 
 ### Option A — Web GUI
@@ -86,6 +88,28 @@ The plugin is **Host-only**, so it activates without any Client approval step. O
 ```
 [win-task-notify] powershell.exe resolved to /mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe
 ```
+
+### Option C — Persistent mount (survives DSH restart, recommended)
+
+[`win-task-notify.mjs`](win-task-notify.mjs) is the same plugin as a proper ESM module for composition rows. Mount it in your agent preset and it loads automatically with every session:
+
+1. Copy the file into your preset directory:
+
+   ```
+   ${DSH_HOME:-~/.dsh}/.agent-presets/<preset-id>/plugins/win-task-notify.mjs
+   ```
+
+2. Add one row at the end of that preset's `agent.cordis.yml` (relative names resolve against the preset directory):
+
+   ```yaml
+   # 消费宿主服务 subprocess/agents/sessionTitle，不发布任何服务 → 无需 isolate realm
+   - id: plugin-win-task-notify
+     name: ./plugins/win-task-notify.mjs
+   ```
+
+3. Mount-validate the preset with `agentPresets.standingKeyFor('<preset-id>')` (or have a DSH agent do it), then restart DSH. Every session on that preset now notifies without any manual activation.
+
+Note: dynamic plugins (Options A/B) live only in the current process; after a DSH restart they are gone, while the preset row loads again automatically. To change what a shipped preset does, copy the preset first (never edit the shipped install) and edit the copy.
 
 ## Verification
 
@@ -145,9 +169,30 @@ DSH（WSL2 内）监听 `agent/status` → 根 agent 进入 `idle` → 构造 Po
 
 ## 安装（DSH 内）
 
+两种方式：**动态插件**（仅当前进程有效）或**预设持久化挂载**（随 DSH 重启自动生效，推荐）。
+
 1. 打开 DSH 的动态插件面板（或使用 `cordis_define` 工具）
 2. 新建插件（id 前缀如 `winntf`），把 [`host.js`](host.js) 中注释块之后的函数体粘贴到 **Host** 代码框（Client 留空）
 3. 激活即可；本轮任务结束时你就会收到第一条通知
+
+**持久化挂载（重启后依然自动生效）**：
+
+1. 把 [`win-task-notify.mjs`](win-task-notify.mjs) 复制到你的 preset 目录：
+
+   ```
+   ${DSH_HOME:-~/.dsh}/.agent-presets/<preset-id>/plugins/win-task-notify.mjs
+   ```
+
+2. 在该 preset 的 `agent.cordis.yml` 末尾加一行（相对路径相对 preset 目录解析）：
+
+   ```yaml
+   - id: plugin-win-task-notify
+     name: ./plugins/win-task-notify.mjs
+   ```
+
+3. 用 `agentPresets.standingKeyFor('<preset-id>')` 挂载验证后重启 DSH，之后每个挂载该 preset 的会话自动生效，无需手动激活。
+
+> 修改内置（shipped）preset 前请先复制副本再改副本，不要直接改部署自带的预设。
 
 ## 验证
 
